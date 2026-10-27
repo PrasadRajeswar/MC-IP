@@ -269,7 +269,9 @@ When the PHY returns 64-bit read data, the formatter slices it across pseudo-cha
 2. `rddata_pc1 = dfi_rddata[63:32]`
 
 Inside each [`mc_pc_core.sv`](file:///home/dell/MC16/p5/mc_pc_core.sv), each 32-bit beat is shifted across 8 consecutive cycles into a 256-bit shift register:
+```math
 $$\text{rdb\_shift}[255:0] \Longleftarrow \{\text{rddata\_pc}[31:0], \text{rdb\_shift}[255:32]\}$$
+```
 
 After 8 beats (`rdb_beat_cnt == 3'd7`), the 256-bit word is driven onto `rdata_axi` and passed to [`mc_read_return_arb.sv`](file:///home/dell/MC16/p5/mc_read_return_arb.sv), crossing the AXI CDC FIFO back to the host AXI4 bus.
 
