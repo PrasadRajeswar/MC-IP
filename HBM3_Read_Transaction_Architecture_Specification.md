@@ -34,9 +34,9 @@ flowchart LR
 
 ### 2.1 Fixed 40-bit Address Mapping (`afe.v` / Spec Section 3.1.4)
 Every address presented on `s_axi_araddr[39:0]` is combinatorially decoded by `address_decoder` in `afe.v`:
-```math
+
 $$\mathtt{addr[39:0]} = \{\mathtt{Reserved[39:33]},\ \mathtt{CH\_SEL[32:29]},\ \mathtt{PC\_SEL[28]},\ \mathtt{ROW[27:14]},\ \mathtt{BG[13:12]},\ \mathtt{BA[11:10]},\ \mathtt{COL[9:5]},\ \mathtt{BYTE\_OFFSET[4:0]}\}$$
-```
+
 | Field Name | Bit Range | Bit Width | Value in Example (Bin / Hex) | Decoded Hardware Target |
 | :--- | :---: | :---: | :--- | :--- |
 | **`byte_offset`** | `addr[4:0]` | 5 bits | `5'b00000` (`5'h00`) | Byte 0 of 32-byte AXI beat (aligned) |
@@ -50,9 +50,9 @@ $$\mathtt{addr[39:0]} = \{\mathtt{Reserved[39:33]},\ \mathtt{CH\_SEL[32:29]},\ \
 
 ### 2.2 Calculated Concrete Address
 Combining the bit fields produces the exact 40-bit address:
-
+```math
 $$\mathtt{s\_axi\_araddr} = \mathtt{40'b0000000\_0010\_0\_01101000110101\_01\_10\_01100\_00000} = \mathbf{40'h00\_468D\_5980}$$
-
+```
 ---
 
 ## 3. The 5 Phases: Step-by-Step Signal & Architectural Walkthrough
