@@ -1,0 +1,270 @@
+= MC16X2 Memory Controller IP: 256-bit AXI WDATA to 64-bit DFI Formatter Transformation Guide
+:author: MC16X2 Architecture Team
+:revdate: 2026-11-11
+:revnumber: 1.0
+:doctype: article
+:toc: left
+:toclevels: 3
+:icons: font
+:sectnums:
+:source-highlighter: highlightjs
+
+== Executive Summary
+
+This specification documents the exact data path transformation and mapping of the *256-bit write data (`s_axi_wdata[255:0]`)* from the Host AXI4 domain down to the *64-bit physical DFI write data bus (`dfi_wrdata[63:0]`)* at the DFI Formatter boundary stage within the **MC16X2 High-Bandwidth Memory Controller IP**.
+
+Specifically, this document addresses two primary microarchitectural questions:
+
+1. *Which bits of the 256-bit AXI write data go to the Pseudo-Channels (PC0 and PC1)?*
+2. *How is the 256-bit AXI data reduced to 64-bit data at the DFI Formatter?*
+
+[IMPORTANT]
+====
+An AXI write transaction does *not* split its 256-bit payload across PC0 and PC1 simultaneously. Rather, an AXI write beat is routed *in its entirety (all 256 bits)* to one specific Pseudo-Channel based on address bit `addr[28]`. The reduction to 64 bits at the DFI pin boundary occurs through a combination of *temporal serialization (8 cycles × 32 bits)* inside the targeted PC core, followed by *spatial concatenation ({PC1, PC0} = 64 bits)* at the DFI Formatter.
+====
+
+---
+
+== System Architecture & Data Path Overview
+
+In the MC16X2 controller architecture, each of the 16 physical HBM3 channels contains two autonomous scheduling cores: *Pseudo-Channel 0 (PC0)* and *Pseudo-Channel 1 (PC1)*.
+
+[listing]
+....
+====================================================================================================
+                        MC16X2 WRITE DATA PATH TRANSFORMATION PIPELINE
+====================================================================================================
+
+  Host SoC Interconnect (aclk = 500 MHz)
+    │
+    │ s_axi_wdata[255:0] (32 bytes per beat)
+    │ s_axi_wstrb[31:0]  (32 byte enables)
+    │ s_axi_awaddr[39:0] (40-bit byte address)
+    ▼
+  Clock Domain Crossing Bridge (mc_axi_cdc.sv)
+    │
+    │ W CDC FIFO (289 bits wide × 16 entries)
+    │ Crosses 500 MHz (aclk) ──► 1 GHz (dfi_clk)
+    ▼
+  AXI Address Decode & Ingress Router (afe.v / mc_addr_decode.sv)
+    │
+    │ addr[32:29] = ch_sel (Channel 0 to 15)
+    │ addr[28]    = pc_sel (0 = PC0, 1 = PC1)
+    │
+    ├───────────────────────────────────────────┐
+    │ If addr[28] == 0                          │ If addr[28] == 1
+    ▼                                           ▼
+  PC0 Core: mc_pc_core.sv (Channel C)        PC1 Core: mc_pc_core.sv (Channel C)
+    │ - Stores all 256b in WDB0                │ - Stores all 256b in WDB1
+    │ - Serializes into 8 × 32-bit beats       │ - Serializes into 8 × 32-bit beats
+    │   (BL8 DRAM burst over 8 cycles)         │   (BL8 DRAM burst over 8 cycles)
+    ▼                                           ▼
+  wrdata_pc0[31:0]                            wrdata_pc1[31:0]
+  wrdata_mask_pc0[3:0]                        wrdata_mask_pc1[3:0]
+  wrdata_en_pc0                               wrdata_en_pc1
+    │                                           │
+    └─────────────────────┬─────────────────────┘
+                          ▼
+  Channel Arbiter & Bundler (mc_ch_arb.sv / mc_channel_arb.sv)
+    │
+    │ combined_wrdata[63:0]      = {wrdata_pc1[31:0], wrdata_pc0[31:0]}
+    │ combined_wrdata_mask[7:0]  = {wrdata_mask_pc1[3:0], wrdata_mask_pc0[3:0]}
+    │ combined_wrdata_en[1:0]    = {wrdata_en_pc1, wrdata_en_pc0}
+    ▼
+  DFI Output Formatter: Boundary Flop Stage (mc_dfi_fmt.sv / mc_dfi_formatter.sv)
+    │
+    │ Registered Flop (Cycle N ──► N+1 at 1 GHz):
+    │   dfi_wrdata[63:0]      <= combined_wrdata;
+    │   dfi_wrdata_mask[7:0]  <= combined_wrdata_mask;
+    │   dfi_wrdata_en[1:0]    <= combined_wrdata_en;
+    ▼
+  HBM3 DFI 5.0 Physical Interface Pins
+    - dfi_wrdata[31:0]  : Dedicated to PC0 DRAM micro-pins
+    - dfi_wrdata[63:32] : Dedicated to PC1 DRAM micro-pins
+====================================================================================================
+....
+
+---
+
+== Destination Routing: Which Bits Go to Which PC?
+
+=== 40-bit Address Slice Mapping
+
+The Host AXI4 40-bit byte address `s_axi_awaddr[39:0]` is sliced deterministically by `mc_addr_decode.sv` and `address_decoder` in `afe.v`:
+
+[cols="1,1,2,3", options="header"]
+|===
+| Bit Range | Field Name | Width | Functional Description
+| `[4:0]` | `byte_offset` | 5 bits | Byte index within 32-byte (256-bit) beat
+| `[9:5]` | `col_addr` | 5 bits | Column address (32 columns per active row)
+| `[11:10]` | `bank_addr` | 2 bits | Bank index (4 banks per bank group)
+| `[13:12]` | `bank_group` | 2 bits | Bank Group index (4 bank groups)
+| `[27:14]` | `row_addr` | 14 bits | Row address (16,384 rows per bank)
+| `[28]` | `pc_sel` | 1 bit | *Pseudo-Channel Select*: `0` = PC0, `1` = PC1
+| `[32:29]` | `ch_sel` | 4 bits | *Channel Select*: 0 to 15 (16 physical channels)
+| `[39:33]` | `reserved` | 7 bits | Reserved (must be driven 0)
+|===
+
+=== Routing Logic
+
+In `afe.v` (and `mc16x2.sv`), the demultiplexing logic routes incoming write traffic exclusively to the addressed Channel and Pseudo-Channel:
+
+[source,systemverilog]
+----
+// Slicing in afe.v / mc_addr_decode.sv
+assign ch_sel = in_addr[32:29];
+assign pc_sel = in_addr[28];
+
+// Dispatching in mc_ch_pc_router (afe.v)
+always_comb begin
+    for (int c = 0; c < 16; c++) begin
+        for (int p = 0; p < 2; p++) begin
+            out_valid[c][p] = 1'b0;
+        end
+    end
+    if (in_valid) begin
+        out_valid[ch_sel][pc_sel] = 1'b1; // Exclusively targets one PC!
+    end
+end
+----
+
+[NOTE]
+====
+* If `addr[28] == 0`: **Bits `[255:0]`** of `s_axi_wdata` belong entirely to **Pseudo-Channel 0 (PC0)**.
+* If `addr[28] == 1`: **Bits `[255:0]`** of `s_axi_wdata` belong entirely to **Pseudo-Channel 1 (PC1)**.
+* No static 128-bit splitting occurs across PCs. Each PC receives complete 256-bit blocks for transactions mapped to its memory address range.
+====
+
+---
+
+== 256-bit to 64-bit Data Reduction at the Formatter
+
+The transformation of 256-bit AXI data into 64-bit DFI data is a two-step mechanism:
+
+1. *Step 1: Temporal Serialization (256b ──► 32b)*: Carried out by the target PC's Write Data Buffer (`mc_wdb.sv`).
+2. *Step 2: Spatial Aggregation (Two 32b Lanes ──► 64b Bus)*: Carried out by the Channel Arbiter (`mc_ch_arb.sv`) and registered by the DFI Formatter (`mc_dfi_fmt.sv`).
+
+=== Step 1: Temporal Serialization (256b ──► 32b inside the PC Core)
+
+* **Physical Bus Width per PC:** Each Pseudo-Channel in HBM3 has a 32-bit wide data interface on the physical DFI connector.
+* **DRAM Burst Protocol:** An HBM3 transaction executes a **Burst Length of 8 (BL8)**.
+* **Calculation:**
++
+[stem]
+++++
+\text{Total Payload} = 8 \text{ beats} \times 32 \text{ bits/beat} = 256 \text{ bits} = 32 \text{ bytes}
+++++
++
+This exactly matches one single 256-bit AXI data beat (`s_axi_wdata[255:0]`).
+
+Over 8 successive 1 GHz clock cycles, the PC core serializes the 256-bit word stored in its WDB onto the 32-bit `wrdata_pc` output lane:
+
+[cols="1,2,2,3", options="header"]
+|===
+| DRAM Beat | Clock Cycle | Data Bits Driven to `wrdata_pc[31:0]` | Strobe Bits Driven to `wrdata_mask_pc[3:0]`
+| **Beat 0** | Cycle $T_0$ | `wdata[31:0]` (Byte 0 to 3) | `wstrb[3:0]`
+| **Beat 1** | Cycle $T_1$ | `wdata[63:32]` (Byte 4 to 7) | `wstrb[7:4]`
+| **Beat 2** | Cycle $T_2$ | `wdata[95:64]` (Byte 8 to 11) | `wstrb[11:8]`
+| **Beat 3** | Cycle $T_3$ | `wdata[127:96]` (Byte 12 to 15) | `wstrb[15:12]`
+| **Beat 4** | Cycle $T_4$ | `wdata[159:128]` (Byte 16 to 19) | `wstrb[19:16]`
+| **Beat 5** | Cycle $T_5$ | `wdata[191:160]` (Byte 20 to 23) | `wstrb[23:20]`
+| **Beat 6** | Cycle $T_6$ | `wdata[223:192]` (Byte 24 to 27) | `wstrb[27:24]`
+| **Beat 7** | Cycle $T_7$ | `wdata[255:224]` (Byte 28 to 31) | `wstrb[31:28]`
+|===
+
+[TIP]
+====
+In the simulation harness / phase model (`mc_top.sv` line 379 and `p5/mc_pc_core.sv` line 341), single-beat verification connects `m_wdata[31:0]` directly to verify signal integrity before engaging the multi-beat burst counter.
+====
+
+=== Step 2: Spatial Aggregation at the DFI Formatter (Two 32b Streams ──► 64b DFI Bus)
+
+The DFI Formatter (`mc_dfi_fmt.sv` / `mc_dfi_formatter.sv`) serves as the 1-cycle registered boundary flop stage at 1 GHz. It aggregates the 32-bit data stream from PC0 and the 32-bit data stream from PC1 into the shared 64-bit physical DFI bus.
+
+==== Bit Mapping on `dfi_wrdata[63:0]`
+
+[listing]
+....
+dfi_wrdata[63:0]:      [63 .................... 32] [31 .................... 0]
+Lane Assignment:            PC1 (32-bit beat)            PC0 (32-bit beat)
+
+dfi_wrdata_mask[7:0]:  [7 ....................... 4] [3 ....................... 0]
+Byte Mask:                  PC1 (4 byte strobes)         PC0 (4 byte strobes)
+
+dfi_wrdata_en[1:0]:    [1]                          [0]
+Enable Strobes:             PC1 Write Enable             PC0 Write Enable
+....
+
+==== RTL Implementation
+
+In `mc_ch_arb.sv` and `mc_dfi_fmt.sv`:
+
+[source,systemverilog]
+----
+// Inside mc_ch_arb.sv (Combinational Bundling):
+assign combined_wrdata      = {wrdata_pc1[31:0], wrdata_pc0[31:0]};
+assign combined_wrdata_mask = {wrdata_mask_pc1[3:0], wrdata_mask_pc0[3:0]};
+assign combined_wrdata_en   = {wrdata_en_pc1, wrdata_en_pc0};
+
+// Inside mc_dfi_fmt.sv (1-Cycle Registered Boundary Stage):
+always_ff @(posedge dfi_clk or negedge dfi_reset_n) begin
+    if (!dfi_reset_n) begin
+        dfi_wrdata      <= '0;
+        dfi_wrdata_mask <= '0;
+        dfi_wrdata_en   <= '0;
+    end else begin
+        dfi_wrdata      <= combined_wrdata;       // [31:0]=PC0, [63:32]=PC1
+        dfi_wrdata_mask <= combined_wrdata_mask;  // [3:0]=PC0,  [7:4]=PC1
+        dfi_wrdata_en   <= combined_wrdata_en;    // [0]=PC0,    [1]=PC1
+    end
+end
+----
+
+---
+
+== Symmetric Read Return Path (64b DFI ──► 256b AXI)
+
+The read data return path operates with exact mathematical symmetry to the write path:
+
+1. **DFI PHY Read Return:** The HBM3 PHY drives 64-bit read data `dfi_rddata[63:0]` into the DFI Formatter.
+2. **DFI Formatter Slicing:** The formatter demultiplexes the 64-bit bus into two 32-bit streams:
++
+[source,systemverilog]
+----
+rddata_pc0 <= dfi_rddata[31:0];   // Routed to PC0 Read Buffer
+rddata_pc1 <= dfi_rddata[63:32];  // Routed to PC1 Read Buffer
+----
+3. **8-Beat Shift Register Reassembly:** Inside `mc_pc_core.sv` (lines 363–369), the returning 32-bit beats are accumulated over 8 cycles into a 256-bit shift register:
++
+[source,systemverilog]
+----
+always_ff @(posedge dfi_clk) begin
+    if (rddata_valid_pc) begin
+        rdb_shift    <= {rddata_pc[31:0], rdb_shift[255:32]};
+        rdb_beat_cnt <= rdb_beat_cnt + 1'b1;
+        if (rdb_beat_cnt == 3'd7) begin
+            rdb_valid <= 1'b1; // All 256 bits collected!
+        end
+    end
+end
+----
+4. **CDC Egress:** The fully reassembled 256-bit word is driven onto `rdata_axi[255:0]`, enters the R CDC FIFO (267 bits wide), and is returned to the Host as `s_axi_rdata[255:0]`.
+
+---
+
+== Summary Cheatsheet
+
+[cols="1,2,2", options="header"]
+|===
+| Dimension | Write Path (Host ──► DRAM) | Read Path (DRAM ──► Host)
+| **Host AXI Bus Width** | 256 bits (`s_axi_wdata[255:0]`) @ 500 MHz | 256 bits (`s_axi_rdata[255:0]`) @ 500 MHz
+| **CDC FIFO Width** | 289 bits (256b data + 32b strb + 1b last) | 267 bits (256b data + 8b ID + 2b resp + 1b last)
+| **PC Allocation** | 100% of the 256b beat goes to the PC selected by `addr[28]` | 100% of the 256b return is collected by the targeted PC
+| **Core Serialization** | 1 × 256b word serialized to 8 × 32b beats (BL8) | 8 × 32b beats reassembled to 1 × 256b word via shift reg
+| **Per-PC Core DFI Lane** | 32 bits (`wrdata_pc[31:0]`) @ 1 GHz | 32 bits (`rddata_pc[31:0]`) @ 1 GHz
+| **DFI Formatter Width** | 64 bits (`dfi_wrdata[63:0]` = `{PC1, PC0}`) | 64 bits (`dfi_rddata[63:0]` sliced to `{PC1, PC0}`)
+| **Boundary Flop Latency** | 1 cycle registered boundary stage (`dfi_clk`) | 1 cycle registered boundary stage (`dfi_clk`)
+|===
+
+---
+*MC16X2 High-Bandwidth Memory Controller IP Architectural Reference.*
