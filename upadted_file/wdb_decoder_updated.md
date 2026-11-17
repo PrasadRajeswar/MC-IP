@@ -583,5 +583,7 @@ endmodule : mc_wdb
   2. **`mc16x2.sv`:** Must maintain `write_enable[pc]` and drive `lane_data` across all 8 cycles of `wbeat` instead of pulsing for 1 cycle.
   3. **`mc_timing_check.sv`:** Must ensure column-to-column write spacing ($t_{CCD}$) prevents the same PC from scheduling another column command while its 8-cycle data burst is occupying the lane.
 
+<img width="1824" height="916" alt="image" src="https://github.com/user-attachments/assets/6c860920-9415-4e68-b9f1-394e6d9cd6b9" />
+
 ---
 *Document generated on 2026-11-17. References: `MC_IP_Microarchitecture_Spec6.pdf`, `WRITE_TRANSACTION_SIGNAL_ORDER_GUIDE.md`.*
